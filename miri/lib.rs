@@ -3,11 +3,13 @@
     rustc_private,
     conservative_impl_trait,
     catch_expr,
+    macro_vis_matcher,
 )]
 
 // From rustc.
 #[macro_use]
 extern crate log;
+
 #[macro_use]
 extern crate rustc;
 extern crate rustc_mir;
@@ -18,7 +20,7 @@ extern crate regex;
 extern crate lazy_static;
 
 use rustc::ty::{self, TyCtxt};
-use rustc::ty::layout::{TyLayout, LayoutOf};
+use rustc::ty::layout::{TyLayout, LayoutOf, Align};
 use rustc::hir::def_id::DefId;
 use rustc::mir;
 use rustc::traits;
@@ -55,14 +57,13 @@ pub fn eval_main<'a, 'tcx: 'a>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     main_id: DefId,
     start_wrapper: Option<DefId>,
-    limits: ResourceLimits,
 ) {
     fn run_main<'a, 'tcx: 'a>(
-        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, Evaluator<'tcx>>,
+        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, 'tcx, Evaluator<'tcx>>,
         main_id: DefId,
         start_wrapper: Option<DefId>,
     ) -> EvalResult<'tcx> {
-        let main_instance = ty::Instance::mono(ecx.tcx, main_id);
+        let main_instance = ty::Instance::mono(ecx.tcx.tcx, main_id);
         let main_mir = ecx.load_mir(main_instance.def)?;
         let mut cleanup_ptr = None; // Pointer to be deallocated when we are done
 
@@ -74,7 +75,7 @@ pub fn eval_main<'a, 'tcx: 'a>(
         }
 
         if let Some(start_id) = start_wrapper {
-            let start_instance = ty::Instance::mono(ecx.tcx, start_id);
+            let start_instance = ty::Instance::mono(ecx.tcx.tcx, start_id);
             let start_mir = ecx.load_mir(start_instance.def)?;
 
             if start_mir.arg_count != 3 {
@@ -87,6 +88,7 @@ pub fn eval_main<'a, 'tcx: 'a>(
             // Return value
             let size = ecx.tcx.data_layout.pointer_size.bytes();
             let align = ecx.tcx.data_layout.pointer_align.abi();
+            let align = Align::from_bytes(align, align).unwrap();
             let ret_ptr = ecx.memory_mut().allocate(size, align, Some(MemoryKind::Stack))?;
             cleanup_ptr = Some(ret_ptr);
 
@@ -95,7 +97,7 @@ pub fn eval_main<'a, 'tcx: 'a>(
                 start_instance,
                 start_mir.span,
                 start_mir,
-                Place::from_ptr(ret_ptr),
+                Place::from_ptr(ret_ptr, align),
                 StackPopCleanup::None,
             )?;
 
@@ -104,8 +106,8 @@ pub fn eval_main<'a, 'tcx: 'a>(
             // First argument: pointer to main()
             let main_ptr = ecx.memory_mut().create_fn_alloc(main_instance);
             let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-            let main_ty = main_instance.def.def_ty(ecx.tcx);
-            let main_ptr_ty = ecx.tcx.mk_fn_ptr(main_ty.fn_sig(ecx.tcx));
+            let main_ty = ecx.tcx.type_of(main_instance.def_id());
+            let main_ptr_ty = ecx.tcx.mk_fn_ptr(main_ty.fn_sig(ecx.tcx.tcx));
             ecx.write_value(
                 ValTy {
                     value: Value::ByVal(PrimVal::Ptr(main_ptr)),
@@ -125,9 +127,10 @@ pub fn eval_main<'a, 'tcx: 'a>(
             let ty = ecx.tcx.mk_imm_ptr(ecx.tcx.mk_imm_ptr(ecx.tcx.types.u8));
             let foo = ecx.memory.allocate_cached(b"foo\0");
             let ptr_size = ecx.memory.pointer_size();
-            let foo_ptr = ecx.memory.allocate(ptr_size * 1, ptr_size, None)?;
-            ecx.memory.write_primval(foo_ptr.into(), PrimVal::Ptr(foo.into()), ptr_size, false)?;
-            ecx.memory.mark_static_initalized(foo_ptr.alloc_id, Mutability::Immutable)?;
+            let align = Align::from_bytes(ptr_size, ptr_size).unwrap();
+            let foo_ptr = ecx.memory.allocate(ptr_size, align, None)?;
+            ecx.memory.write_primval(foo_ptr.into(), align, PrimVal::Ptr(foo.into()), ptr_size, false)?;
+            ecx.memory.mark_static_initialized(foo_ptr.alloc_id, Mutability::Immutable)?;
             ecx.write_ptr(dest, foo_ptr.into(), ty)?;
 
             assert!(args.next().is_none(), "start lang item has more arguments than expected");
@@ -157,7 +160,8 @@ pub fn eval_main<'a, 'tcx: 'a>(
         Ok(())
     }
 
-    let mut ecx = EvalContext::new(tcx, ty::ParamEnv::empty(traits::Reveal::All), limits, Default::default(), Default::default());
+    let span = tcx.def_span(main_id);
+    let mut ecx = EvalContext::new(tcx.at(span), ty::ParamEnv::empty(traits::Reveal::All), Default::default(), Default::default());
     match run_main(&mut ecx, main_id, start_wrapper) {
         Ok(()) => {
             let leaks = ecx.memory().leak_report();
@@ -166,7 +170,7 @@ pub fn eval_main<'a, 'tcx: 'a>(
             }
         }
         Err(mut e) => {
-            ecx.report(&mut e);
+            ecx.report(&mut e, true, Some(span));
         }
     }
 }
@@ -201,16 +205,16 @@ pub struct MemoryData<'tcx> {
     ///
     /// Only mutable (static mut, heap, stack) allocations have an entry in this map.
     /// The entry is created when allocating the memory and deleted after deallocation.
-    locks: HashMap<u64, RangeMap<LockInfo<'tcx>>>,
+    locks: HashMap<AllocId, RangeMap<LockInfo<'tcx>>>,
 }
 
-impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
+impl<'tcx> Machine<'tcx, 'tcx> for Evaluator<'tcx> {
     type MemoryData = MemoryData<'tcx>;
     type MemoryKinds = memory::MemoryKind;
 
     /// Returns Ok() when the function was handled, fail otherwise
     fn eval_fn_call<'a>(
-        ecx: &mut EvalContext<'a, 'tcx, Self>,
+        ecx: &mut EvalContext<'a, 'tcx, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         destination: Option<(Place, mir::BasicBlock)>,
         args: &[ValTy<'tcx>],
@@ -221,7 +225,7 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
     }
 
     fn call_intrinsic<'a>(
-        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, Self>,
+        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[ValTy<'tcx>],
         dest: Place,
@@ -232,7 +236,7 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
     }
 
     fn try_ptr_op<'a>(
-        ecx: &rustc_mir::interpret::EvalContext<'a, 'tcx, Self>,
+        ecx: &rustc_mir::interpret::EvalContext<'a, 'tcx, 'tcx, Self>,
         bin_op: mir::BinOp,
         left: PrimVal,
         left_ty: ty::Ty<'tcx>,
@@ -242,17 +246,23 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
         ecx.ptr_op(bin_op, left, left_ty, right, right_ty)
     }
 
-    fn mark_static_initialized(m: memory::MemoryKind) -> EvalResult<'tcx> {
-        use memory::MemoryKind::*;
-        match m {
-            // FIXME: This could be allowed, but not for env vars set during miri execution
-            Env => err!(Unimplemented("statics can't refer to env vars".to_owned())),
-            _ => Ok(()),
-        }
+    fn mark_static_initialized<'a>(
+        ecx: &mut rustc_mir::interpret::Memory<'a, 'tcx, 'tcx, Self>,
+        id: AllocId,
+        muta: Mutability,
+    ) -> EvalResult<'tcx, bool> {
+        unimplemented!()
+    }
+
+    fn init_static<'a>(
+        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, 'tcx, Self>,
+        gid: GlobalId<'tcx>,
+    ) -> EvalResult<'tcx, rustc::mir::interpret::AllocId> {
+        unimplemented!()
     }
 
     fn box_alloc<'a>(
-        ecx: &mut EvalContext<'a, 'tcx, Self>,
+        ecx: &mut EvalContext<'a, 'tcx, 'tcx, Self>,
         ty: ty::Ty<'tcx>,
         dest: Place,
     ) -> EvalResult<'tcx> {
@@ -260,7 +270,7 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
 
         // Call the `exchange_malloc` lang item
         let malloc = ecx.tcx.lang_items().exchange_malloc_fn().unwrap();
-        let malloc = ty::Instance::mono(ecx.tcx, malloc);
+        let malloc = ty::Instance::mono(ecx.tcx.tcx, malloc);
         let malloc_mir = ecx.load_mir(malloc.def)?;
         ecx.push_stack_frame(
             malloc,
@@ -302,35 +312,30 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
     }
 
     fn global_item_with_linkage<'a>(
-        ecx: &mut EvalContext<'a, 'tcx, Self>,
+        ecx: &mut EvalContext<'a, 'tcx, 'tcx, Self>,
         instance: ty::Instance<'tcx>,
         mutability: Mutability,
     ) -> EvalResult<'tcx> {
         // FIXME: check that it's `#[linkage = "extern_weak"]`
         trace!("Initializing an extern global with NULL");
         let ptr_size = ecx.memory.pointer_size();
+        let align = Align::from_bytes(ptr_size, ptr_size).unwrap();
         let ptr = ecx.memory.allocate(
             ptr_size,
-            ptr_size,
+            align,
             None,
         )?;
-        ecx.memory.write_ptr_sized_unsigned(ptr, PrimVal::Bytes(0))?;
-        ecx.memory.mark_static_initalized(ptr.alloc_id, mutability)?;
-        ecx.tcx.interpret_interner.borrow_mut().cache(
-            GlobalId {
-                instance,
-                promoted: None,
-            },
-            PtrAndAlign {
-                ptr: ptr.into(),
-                aligned: true,
-            },
+        ecx.memory.write_ptr_sized_unsigned(ptr, align, PrimVal::Bytes(0))?;
+        ecx.memory.mark_static_initialized(ptr.alloc_id, mutability)?;
+        ecx.tcx.interpret_interner.cache(
+            instance.def_id(),
+            ptr.alloc_id,
         );
         Ok(())
     }
 
     fn check_locks<'a>(
-        mem: &Memory<'a, 'tcx, Self>,
+        mem: &Memory<'a, 'tcx, 'tcx, Self>,
         ptr: MemoryPointer,
         size: u64,
         access: AccessKind,
@@ -339,15 +344,15 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
     }
 
     fn add_lock<'a>(
-        mem: &mut Memory<'a, 'tcx, Self>,
-        id: u64,
+        mem: &mut Memory<'a, 'tcx, 'tcx, Self>,
+        id: AllocId,
     ) {
         mem.data.locks.insert(id, RangeMap::new());
     }
 
     fn free_lock<'a>(
-        mem: &mut Memory<'a, 'tcx, Self>,
-        id: u64,
+        mem: &mut Memory<'a, 'tcx, 'tcx, Self>,
+        id: AllocId,
         len: u64,
     ) -> EvalResult<'tcx> {
         mem.data.locks
@@ -372,14 +377,14 @@ impl<'tcx> Machine<'tcx> for Evaluator<'tcx> {
     }
 
     fn end_region<'a>(
-        ecx: &mut EvalContext<'a, 'tcx, Self>,
+        ecx: &mut EvalContext<'a, 'tcx, 'tcx, Self>,
         reg: Option<::rustc::middle::region::Scope>,
     ) -> EvalResult<'tcx> {
         ecx.end_region(reg)
     }
 
     fn validation_op<'a>(
-        ecx: &mut EvalContext<'a, 'tcx, Self>,
+        ecx: &mut EvalContext<'a, 'tcx, 'tcx, Self>,
         op: ::rustc::mir::ValidationOp,
         operand: &::rustc::mir::ValidationOperand<'tcx, ::rustc::mir::Place<'tcx>>,
     ) -> EvalResult<'tcx> {

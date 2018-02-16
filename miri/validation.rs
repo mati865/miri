@@ -108,7 +108,7 @@ pub(crate) trait EvalContextExt<'tcx> {
     ) -> EvalResult<'tcx>;
 }
 
-impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'tcx>> {
+impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, 'tcx, super::Evaluator<'tcx>> {
     fn abstract_place_projection(&self, proj: &mir::PlaceProjection<'tcx>) -> EvalResult<'tcx, AbsPlaceProjection<'tcx>> {
         use self::mir::ProjectionElem::*;
 
@@ -187,7 +187,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
 
         // We need to monomorphize ty *without* erasing lifetimes
         trace!("validation_op1: {:?}", operand.ty.sty);
-        let ty = operand.ty.subst(self.tcx, self.substs());
+        let ty = operand.ty.subst(self.tcx.tcx, self.substs());
         trace!("validation_op2: {:?}", operand.ty.sty);
         let place = self.eval_place(&operand.place)?;
         let abs_place = self.abstract_place(&operand.place)?;
@@ -250,7 +250,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
     }
 
     fn normalize_type_unerased(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        return normalize_associated_type(self.tcx, &ty);
+        return normalize_associated_type(self.tcx.tcx, &ty);
 
         use syntax::codemap::{Span, DUMMY_SP};
 
@@ -394,6 +394,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
             ty::TyNever |
             ty::TyFnDef(..) |
             ty::TyDynamic(..) |
+            ty::TyGeneratorWitness(_) |
             ty::TyForeign(..) => {
                 bug!("TyLayout::field_type({:?}): not applicable", layout)
             }
@@ -430,18 +431,18 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
 
             // Tuples, generators and closures.
             ty::TyClosure(def_id, ref substs) => {
-                substs.upvar_tys(def_id, tcx).nth(i).unwrap()
+                substs.upvar_tys(def_id, tcx.tcx).nth(i).unwrap()
             }
 
             ty::TyGenerator(def_id, ref substs, _) => {
-                substs.field_tys(def_id, tcx).nth(i).unwrap()
+                substs.field_tys(def_id, tcx.tcx).nth(i).unwrap()
             }
 
             ty::TyTuple(tys, _) => tys[i],
 
             // SIMD vector types.
             ty::TyAdt(def, ..) if def.repr.simd() => {
-                layout.ty.simd_type(tcx)
+                layout.ty.simd_type(tcx.tcx)
             }
 
             // ADTs.
@@ -449,14 +450,14 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 use rustc::ty::layout::Variants;
                 match layout.variants {
                     Variants::Single { index } => {
-                        def.variants[index].fields[i].ty(tcx, substs)
+                        def.variants[index].fields[i].ty(tcx.tcx, substs)
                     }
 
                     // Discriminant field for enums (where applicable).
                     Variants::Tagged { ref discr, .. } |
                     Variants::NicheFilling { niche: ref discr, .. } => {
                         assert_eq!(i, 0);
-                        return Ok(discr.value.to_ty(tcx))
+                        return Ok(discr.value.to_ty(tcx.tcx))
                     }
                 }
             }
@@ -509,7 +510,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
         // Check alignment and non-NULLness
         let (_, align) = self.size_and_align_of_dst(pointee_ty, val)?;
         let ptr = self.into_ptr(val)?;
-        self.memory.check_align(ptr, align.abi(), None)?;
+        self.memory.check_align(ptr, align)?;
 
         // Recurse
         let pointee_place = self.val_to_place(val, pointee_ty)?;
@@ -558,7 +559,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
             TyAdt(adt, _) if adt.is_box() => true,
             TySlice(_) | TyAdt(_, _) | TyTuple(..) | TyClosure(..) | TyArray(..) |
             TyDynamic(..) | TyGenerator(..) | TyForeign(_) => false,
-            TyParam(_) | TyInfer(_) | TyProjection(_) | TyAnon(..) | TyError => {
+            TyParam(_) | TyInfer(_) | TyProjection(_) | TyAnon(..) | TyError | TyGeneratorWitness(_) => {
                 bug!("I got an incomplete/unnormalized type for validation")
             }
         };
@@ -567,7 +568,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
             // Tracking the same state for locals not backed by memory would just duplicate too
             // much machinery.
             // FIXME: We ignore alignment.
-            let (ptr, extra) = self.force_allocation(query.place.1)?.to_ptr_extra_aligned();
+            let (ptr, _, extra) = self.force_allocation(query.place.1)?.to_ptr_align_extra();
             // Determine the size
             // FIXME: Can we reuse size_and_align_of_dst for Places?
             let layout = self.layout_of(query.ty)?;
@@ -725,7 +726,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                     Ok(())
                 }
                 TyArray(elem_ty, len) => {
-                    let len = len.val.to_const_int().unwrap().to_u64().unwrap();
+                    let len = len.val.unwrap_u64();
                     for i in 0..len {
                         let inner_place = self.place_index(query.place.1, query.ty, i as u64)?;
                         self.validate(
@@ -771,8 +772,8 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                             let discr = self.read_discriminant_value(query.place.1, query.ty)?;
 
                             // Get variant index for discriminant
-                            let variant_idx = adt.discriminants(self.tcx).position(|variant_discr| {
-                                variant_discr.to_u128_unchecked() == discr
+                            let variant_idx = adt.discriminants(self.tcx.tcx).position(|variant_discr| {
+                                variant_discr.val == discr
                             });
                             let variant_idx = match variant_idx {
                                 Some(val) => val,

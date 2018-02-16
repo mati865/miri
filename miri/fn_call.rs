@@ -1,5 +1,5 @@
 use rustc::ty::{self, Ty};
-use rustc::ty::layout::LayoutOf;
+use rustc::ty::layout::{LayoutOf, Align};
 use rustc::hir::def_id::{DefId, CRATE_DEF_INDEX};
 use rustc::mir;
 use syntax::attr;
@@ -7,8 +7,6 @@ use syntax::abi::Abi;
 use syntax::codemap::Span;
 
 use std::mem;
-
-use rustc::traits;
 
 use super::*;
 
@@ -49,7 +47,7 @@ pub trait EvalContextExt<'tcx> {
     fn write_null(&mut self, dest: Place, dest_ty: Ty<'tcx>) -> EvalResult<'tcx>;
 }
 
-impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'tcx>> {
+impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, 'tcx, super::Evaluator<'tcx>> {
     fn eval_fn_call(
         &mut self,
         instance: ty::Instance<'tcx>,
@@ -112,6 +110,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                     self.write_null(dest, dest_ty)?;
                 } else {
                     let align = self.memory.pointer_size();
+                    let align = Align::from_bytes(align, align).unwrap();
                     let ptr = self.memory.allocate(size, align, Some(MemoryKind::C.into()))?;
                     self.write_primval(dest, PrimVal::Ptr(ptr), dest_ty)?;
                 }
@@ -307,7 +306,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                     // +1 for the null terminator
                     let value_copy = self.memory.allocate(
                         (value.len() + 1) as u64,
-                        1,
+                        Align::from_bytes(1, 1).unwrap(),
                         Some(MemoryKind::Env.into()),
                     )?;
                     self.memory.write_bytes(value_copy.into(), &value)?;
@@ -382,12 +381,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                             instance,
                             promoted: None,
                         };
-                        // compute global if not cached
-                        let val = match self.tcx.interpret_interner.borrow().get_cached(cid) {
-                            Some(ptr) => ptr,
-                            None => eval_body(self.tcx, instance, ty::ParamEnv::empty(traits::Reveal::All)).0?.0,
-                        };
-                        let val = self.value_to_primval(ValTy { value: Value::ByRef(val), ty: args[0].ty })?.to_u64()?;
+                        let val = self.const_eval(cid)?.val.unwrap_u64();
                         if val == name {
                             result = Some(path_value);
                             break;
@@ -416,7 +410,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 };
 
                 // Figure out how large a pthread TLS key actually is. This is libc::pthread_key_t.
-                let key_type = args[0].ty.builtin_deref(true, ty::LvaluePreference::NoPreference)
+                let key_type = args[0].ty.builtin_deref(true)
                                    .ok_or(EvalErrorKind::AbiViolation("Wrong signature used for pthread_key_create: First argument must be a raw pointer.".to_owned()))?.ty;
                 let key_size = self.layout_of(key_type)?.size;
 
@@ -425,8 +419,10 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 if key_size.bits() < 128 && key >= (1u128 << key_size.bits() as u128) {
                     return err!(OutOfTls);
                 }
+                let align = Align::from_bytes(key_size.bytes(), key_size.bytes()).unwrap();
                 self.memory.write_primval(
                     key_ptr.to_ptr()?,
+                    align,
                     PrimVal::Bytes(key),
                     key_size.bytes(),
                     false,
@@ -497,7 +493,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                     for item in mem::replace(&mut items, Default::default()).iter() {
                         if item.ident.name == *segment {
                             if path_it.peek().is_none() {
-                                return Some(ty::Instance::mono(self.tcx, item.def.def_id()));
+                                return Some(ty::Instance::mono(self.tcx.tcx, item.def.def_id()));
                             }
 
                             items = self.tcx.item_children(item.def.def_id());
@@ -559,6 +555,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 if !align.is_power_of_two() {
                     return err!(HeapAllocNonPowerOfTwoAlignment(align));
                 }
+                let align = Align::from_bytes(align, align).unwrap();
                 let ptr = self.memory.allocate(size, align, Some(MemoryKind::Rust.into()))?;
                 self.write_primval(dest, PrimVal::Ptr(ptr), dest_ty)?;
             }
@@ -571,6 +568,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 if !align.is_power_of_two() {
                     return err!(HeapAllocNonPowerOfTwoAlignment(align));
                 }
+                let align = Align::from_bytes(align, align).unwrap();
                 let ptr = self.memory.allocate(size, align, Some(MemoryKind::Rust.into()))?;
                 self.memory.write_repeat(ptr.into(), 0, size)?;
                 self.write_primval(dest, PrimVal::Ptr(ptr), dest_ty)?;
@@ -585,6 +583,7 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 if !align.is_power_of_two() {
                     return err!(HeapAllocNonPowerOfTwoAlignment(align));
                 }
+                let align = Align::from_bytes(align, align).unwrap();
                 self.memory.deallocate(
                     ptr,
                     Some((old_size, align)),
@@ -606,6 +605,8 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, super::Evaluator<'
                 if !new_align.is_power_of_two() {
                     return err!(HeapAllocNonPowerOfTwoAlignment(new_align));
                 }
+                let new_align = Align::from_bytes(new_align, new_align).unwrap();
+                let old_align = Align::from_bytes(old_align, old_align).unwrap();
                 let new_ptr = self.memory.reallocate(
                     ptr,
                     old_size,
