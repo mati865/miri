@@ -122,6 +122,7 @@ fn after_analysis<'a, 'tcx>(state: &mut CompileState<'a, 'tcx>) {
                         );
                         miri::eval_main(self.0, did, None);
                         self.1.session.abort_if_errors();
+                        ::std::process::exit(0);
                     }
                 }
             }
@@ -143,12 +144,14 @@ fn after_analysis<'a, 'tcx>(state: &mut CompileState<'a, 'tcx>) {
         miri::eval_main(tcx, entry_def_id, start_wrapper);
 
         state.session.abort_if_errors();
+        ::std::process::exit(0);
     } else {
         println!("no main function found, assuming auxiliary build");
     }
 }
 
 fn init_logger() {
+    rustc_driver::init_rustc_env_logger();
     let format = |buf: &mut env_logger::Formatter, record: &log::Record| {
         if record.level() == log::Level::Trace {
             // prepend frame number

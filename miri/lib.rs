@@ -22,6 +22,7 @@ extern crate lazy_static;
 use rustc::ty::{self, TyCtxt};
 use rustc::ty::layout::{TyLayout, LayoutOf, Align};
 use rustc::hir::def_id::DefId;
+use rustc::hir;
 use rustc::mir;
 use rustc::traits;
 
@@ -75,7 +76,14 @@ pub fn eval_main<'a, 'tcx: 'a>(
         }
 
         if let Some(start_id) = start_wrapper {
-            let start_instance = ty::Instance::mono(ecx.tcx.tcx, start_id);
+            let main_ret_ty = ecx.tcx.fn_sig(main_id).output();
+            let main_ret_ty = main_ret_ty.no_late_bound_regions().unwrap();
+            let start_instance = ty::Instance::resolve(
+                ecx.tcx.tcx,
+                ty::ParamEnv::empty(traits::Reveal::All),
+                start_id,
+                ecx.tcx.mk_substs(
+                    ::std::iter::once(ty::subst::Kind::from(main_ret_ty)))).unwrap();
             let start_mir = ecx.load_mir(start_instance.def)?;
 
             if start_mir.arg_count != 3 {
@@ -247,18 +255,79 @@ impl<'tcx> Machine<'tcx, 'tcx> for Evaluator<'tcx> {
     }
 
     fn mark_static_initialized<'a>(
-        ecx: &mut rustc_mir::interpret::Memory<'a, 'tcx, 'tcx, Self>,
+        mem: &mut rustc_mir::interpret::Memory<'a, 'tcx, 'tcx, Self>,
         id: AllocId,
         muta: Mutability,
     ) -> EvalResult<'tcx, bool> {
-        unimplemented!()
+        match muta {
+            Mutability::Immutable => Ok(false),
+            Mutability::Mutable => {
+                let alloc = mem.alloc_map.remove(&id);
+                mem.alloc_kind.remove(&id);
+                let uninit = mem.statics.remove(&id);
+                if let Some(mut alloc) = alloc.or(uninit) {
+                    // ensure llvm knows not to put this into immutable memroy
+                    alloc.runtime_mutability = muta;
+                    // recurse into inner allocations
+                    for &alloc in alloc.relocations.values() {
+                        mem.mark_inner_allocation_initialized(alloc, muta)?;
+                    }
+                    // reuse the statics store
+                    mem.statics.insert(id, alloc);
+                } else {
+                    bug!("no allocation found for {:?}", id);
+                }
+                Ok(true)
+            },
+        }
     }
 
     fn init_static<'a>(
         ecx: &mut rustc_mir::interpret::EvalContext<'a, 'tcx, 'tcx, Self>,
         gid: GlobalId<'tcx>,
     ) -> EvalResult<'tcx, rustc::mir::interpret::AllocId> {
-        unimplemented!()
+        if let Some(id) = ecx.tcx.interpret_interner.get_cached(gid.instance.def_id()) {
+            return Ok(id);
+        }
+        let instance_ty = gid.instance.ty(ecx.tcx.tcx);
+        let layout = ecx.layout_of(instance_ty)?;
+        let internally_mutable = !layout.ty.is_freeze(ecx.tcx.tcx, ecx.param_env, ecx.tcx.def_span(gid.instance.def_id()));
+        let mutability = if internally_mutable {
+            Mutability::Mutable
+        } else {
+            ecx.tcx.is_static(gid.instance.def_id()).map_or(Mutability::Immutable, |muta| match muta {
+                hir::Mutability::MutImmutable => Mutability::Immutable,
+                hir::Mutability::MutMutable => Mutability::Mutable,
+            })
+        };
+        if ecx.tcx.has_attr(gid.instance.def_id(), "linkage") {
+            // precompute
+            Self::global_item_with_linkage(ecx, gid.instance, mutability)?;
+            return Ok(ecx.tcx.interpret_interner.get_cached(gid.instance.def_id()).unwrap());
+        }
+        assert!(!layout.is_unsized());
+        let ptr = ecx.memory.allocate(
+            layout.size.bytes(),
+            layout.align,
+            None,
+        )?;
+        ecx.tcx.interpret_interner.cache(gid.instance.def_id(), ptr.alloc_id);
+        let cleanup = StackPopCleanup::MarkStatic(mutability);
+        let name = ty::tls::with(|tcx| tcx.item_path_str(gid.instance.def_id()));
+        trace!("pushing stack frame for global: {}", name);
+        let mir = ecx.load_mir(gid.instance.def)?;
+        let n = ecx.stack().len();
+        ecx.push_stack_frame(
+            gid.instance,
+            mir.span,
+            mir,
+            Place::from_ptr(ptr, layout.align),
+            cleanup,
+        )?;
+        while n < ecx.stack().len() {
+            ecx.step()?;
+        }
+        Ok(ptr.alloc_id)
     }
 
     fn box_alloc<'a>(

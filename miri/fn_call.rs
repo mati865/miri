@@ -454,6 +454,11 @@ impl<'a, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'tcx, 'tcx, super::Evalu
                 self.write_null(dest, dest_ty)?;
             }
 
+            "pthread_getattr_np" => {
+                // hack to get get_stack_start to return None
+                self.write_primval(dest, PrimVal::Bytes(1), dest_ty)?;
+            }
+
             // Stub out all the other pthread calls to just return 0
             link_name if link_name.starts_with("pthread_") => {
                 info!("ignoring C ABI call: {}", link_name);
